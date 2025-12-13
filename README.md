@@ -26,7 +26,7 @@ We will quantize them using a 4 bit integer, so we have the values:
 
 `[-1, -0.875, -0.75, -0.625, -0.5, -0.375, -0.25, -0.125, 0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1]`
 
-If we set the scaling factor as 0.6 the weights become [0.15625, 0.302083, -0.27083, 1]. After asigning them to their closest points we get an MSE of 0.00412. If we instead set the scale to 0.98, we get an MSE of 0.00354. Because my method uses heavily quantized scales I simply use a brute force search for the optimal scales.
+If we set the scaling factor as 0.96 the weights become [0.15625, 0.302083, -0.27083, 1]. After asigning them to their closest points we get an MSE of 0.00412. If we instead set the scale to 0.98, we get an MSE of 0.00354. Because my method uses heavily quantized scales I simply use a brute force search for the optimal scales.
 
 ### Calibration
 
