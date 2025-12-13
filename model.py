@@ -27,8 +27,6 @@ THREAD_POOL = ThreadPoolExecutor(PHYSICAL_CORES)
 # Synchronize with the NULL stream, as that is where we will create the output buffers
 STREAM = cu.cuda.Stream(non_blocking=False)
 
-numFP16Weights = 0
-
 def quantize_matrix(input: np.ndarray, config: QuantConfig, optimize: int, calibration: np.ndarray | None = None) -> np.ndarray:
     # Quantize a 2D matrix using multithreading
     # To keep peak memory usage under control do not 
@@ -145,7 +143,6 @@ class QuantizedLinear(torch.nn.Module):
             optimize: int = OPTIMIZE_FAST,
             batches: int = 1,
             buffer: torch.Tensor | None = None,
-            xyz = False
         ):
         """Initializes a linear like module with quantized weights.
         Args:
@@ -162,11 +159,7 @@ class QuantizedLinear(torch.nn.Module):
             buffer: use this preallocated torch.Tensor as scratch memory for dequantization,
                 which allows employing CUDA graphs for improved performance
         """
-        global numFP16Weights
         super().__init__()
-
-        this.mx = None
-        this.ind = None
 
         if type(module) is torch.nn.Linear or type(module) is CalibrationLinear:
             calibration = None
@@ -179,27 +172,6 @@ class QuantizedLinear(torch.nn.Module):
             this.device = module.weight.device
             this.dtype = module.weight.dtype
             this.quantConfig = QuantConfig(quant)
-
-            if False and calibration is not None:
-                sortedActivations = np.flip(np.sort(calibration[0]))
-                median = sortedActivations[calibration.shape[1] // 2]
-                print(sortedActivations[:20])
-                print(len(calibration[0]))
-
-                this.ind = []
-                this.mx = []
-                while sortedActivations[len(this.ind)] > median * 60:
-                #for activation in range(0):
-                    this.ind.append(np.argmax(calibration[0]))
-                    this.mx.append(torch.clone(module.weight[:, this.ind[-1]]))
-                    calibration[:, this.ind[-1]] = 0
-
-                print(this.ind)
-                numFP16Weights += len(calibration[0]) * len(this.mx)
-                print(f"FP16 {numFP16Weights}")
-
-
-
             this.quantizedWeights = quantize_matrix(module.weight.numpy(force=True), this.quantConfig, optimize, calibration)
             if this.device.type == "cuda":
                 this.quantizedWeights = torch.tensor(this.quantizedWeights, dtype=torch.uint8, device="cuda")
@@ -212,11 +184,11 @@ class QuantizedLinear(torch.nn.Module):
             this.quantConfig = module.quantConfig
             this.quantizedWeights = module.quantizedWeights
 
-        this.batches = 1#batches
-        this.buffer = None#buffer
-        """if this.buffer is not None:
+        this.batches = batches
+        this.buffer = buffer
+        if this.buffer is not None:
             this.buffer = buffer[:this.shape[0] * this.shape[1] // this.batches].reshape((-1, this.shape[1]))
-            this.buffer = cu.asarray(this.buffer) # These will share the underlying memory"""
+            this.buffer = cu.asarray(this.buffer) # These will share the underlying memory
         this.graphs = [None] * this.batches # CUDA graphs
 
     def forward(this, input: torch.Tensor):
@@ -256,10 +228,6 @@ class QuantizedLinear(torch.nn.Module):
             
             if this.device.type == "cuda":
                 weights = dequantize_cuda(this.buffer, this.quantizedWeights, 0)
-                x = torch.as_tensor(weights, device="cuda")
-                if this.mx is not None:
-                    for idx in range(len(this.mx)):
-                        x[:, this.ind[idx]] = this.mx[idx]
                 return torch.nn.functional.linear(input, torch.as_tensor(weights, device="cuda"), this.bias)
         
         # Compute this module in multiple steps, dequantizing only a subset of the weights per step to limit peak memory

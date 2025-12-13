@@ -49,7 +49,7 @@ QUANT_CONFIG = {
         "gate": "Q4L",
     },
     "output": "Q4L",
-    "optimize": OPTIMIZE_FAST
+    "optimize": OPTIMIZE_STANDARD
 }
 
 def calculate_calibration_matrix(calibration, model):
@@ -120,9 +120,9 @@ def load_quantized_model(model: str, file: str | None, device: str, quant_config
             calculate_calibration_matrix(calibration, model)
 
         for layer in model.model.layers:
-            layer.mlp.gate_proj = QuantizedLinear(layer.mlp.gate_proj, quant=quant_config["ffn"]["gate"], optimize=quant_config["optimize"], buffer=model.graph_buffer, xyz=True)
-            layer.mlp.up_proj = QuantizedLinear(layer.mlp.up_proj, quant=quant_config["ffn"]["up"], optimize=quant_config["optimize"], buffer=model.graph_buffer, xyz=True)
-            layer.mlp.down_proj = QuantizedLinear(layer.mlp.down_proj, quant=quant_config["ffn"]["down"], optimize=quant_config["optimize"], buffer=model.graph_buffer, xyz=True)
+            layer.mlp.gate_proj = QuantizedLinear(layer.mlp.gate_proj, quant=quant_config["ffn"]["gate"], optimize=quant_config["optimize"], buffer=model.graph_buffer)
+            layer.mlp.up_proj = QuantizedLinear(layer.mlp.up_proj, quant=quant_config["ffn"]["up"], optimize=quant_config["optimize"], buffer=model.graph_buffer)
+            layer.mlp.down_proj = QuantizedLinear(layer.mlp.down_proj, quant=quant_config["ffn"]["down"], optimize=quant_config["optimize"], buffer=model.graph_buffer)
             layer.self_attn.q_proj = QuantizedLinear(layer.self_attn.q_proj, quant=quant_config["attention"]["q"], optimize=quant_config["optimize"], buffer=model.graph_buffer)
             layer.self_attn.k_proj = QuantizedLinear(layer.self_attn.k_proj, quant=quant_config["attention"]["k"], optimize=quant_config["optimize"], buffer=model.graph_buffer)
             layer.self_attn.v_proj = QuantizedLinear(layer.self_attn.v_proj, quant=quant_config["attention"]["v"], optimize=quant_config["optimize"], buffer=model.graph_buffer)

@@ -4,7 +4,9 @@ This is a small research project to learn about model quantization. I used a sma
 
 ![](quants.png)
 
-The algorithm performs respectably against industry standards like bitsandbytes and gguf, even outperforming the latter by a bit, though it likely falls short of newer methods like QTIP or EXL3.
+All tests were performed with all tensors quantized to the same bits per weight on the Qwen2.5-1.5B model. The exceptions are bitsandbytes which cannot quantize the embeddings and output tensors, and GGUF which cannot quantize those below 3 bpw.
+
+The algorithm performs respectably against industry standards like bitsandbytes and GGUF, even outperforming the latter by a bit, though it likely falls short of newer methods like QTIP or EXL3.
 
 # How it works
 
