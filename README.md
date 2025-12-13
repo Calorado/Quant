@@ -34,7 +34,7 @@ The basic nn.Linear module performs a simple matrix multiplication (model weight
 
 `out[0] = (weight[0][0] * in[0]) + (weight[0][1] * in[1]) + (weight[0][2] * in[2])...`
 
-Now let's assume that we have to apply an error of 0.2 to any one of the model weights. To which one should we apply the error to get the smallest error possible in the final output? To the smallest input vector.  
+Now let's assume that we have to apply an error of 0.2 to any one of the model weights. To which one should we apply the error to get the smallest error possible in the final output? To the one that multiplies the smallest input element.  
 
 The calibration pass records the average quadratic value of the activations, and then uses that to perform a weighted mean squared error on the optimization pass.
 
