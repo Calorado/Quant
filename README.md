@@ -11,7 +11,7 @@ The algorithm performs respectably against industry standards like bitsandbytes 
 # How it works
 
 The algorithm is based on other microscaling formats like MXFP4, NVFP4 and the different methods in GGUF.
-- There are 2 sets of scales, with one super scale in FP8 or FP6 format and sub scales in INT4 format. The groups sizes are 128 for super scales and 8/16/32 for sub scales depending on the configuration.  
+- There are 2 sets of scales, with one super scale in FP8 format and sub scales in INT4 or INT2 format. The groups sizes are 128 for super scales and 8/16/32 for sub scales depending on the configuration.  
 - There are 2 methods to encode the weights:
     - The first is faster and is used for 4 bits and up. The actual weight is obtained by dividing the signed integer weight by 2^(N-1)-1, where N is the number of bits, and applying this formula `(abs(x)*x+2x)/3`. As we are using signed integers there is always one more negative value than positive, and this asymmetry leads to poor slot utilization below 4 bits.  
     - At lower bit rates the weights are grouped in pairs, treated as points in a 2D plane and converted into magnitudes and angles. Given N as the number of bits, 2^N-1 values are allocated for magnitudes, 2^N+1 for angles and the last value is allocated for the 0. This gives much more even slot utilization, necessary for optimal quantization.
@@ -42,7 +42,7 @@ The calibration pass records the average quadratic value of the activations, and
 
 - Affine quantization (having a zero point along with the scale) is basically useless as the distribution of weights is centered at zero.
 - It is better to have heavily quantized scales and smaller groups. At low bits you can get away with a single mantissa bit.
-- KLD seems proportional to the MSE of the quantized weights all the way down to ~3.2 bits. At 2 bits the KLD explodes, possibly because the model is so quantized that it just stops functioning. This also means that the KLD quadruples with every removed bit, making it very hard to get to low bits per weight.
+- KLD seems proportional to the MSE of the quantized weights all the way down to ~3.2 bits. At 2 bits the KLD shows a bigger than expected increase, possibly because the model is so quantized that it stops functioning. This also means that the KLD quadruples with every removed bit, making it very hard to get to low bits per weight.
 - Bigger models are less sensitive to quantization. This is likely due to having to store less information per weight. For example, for the Qwen2.5 family:  
 
 | Model | KLD    |  

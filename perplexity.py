@@ -14,8 +14,11 @@ If not, see <https://www.gnu.org/licenses/>.
 from model import QuantizedEmbedding, QuantizedLinear, CalibrationLinear, OPTIMIZE_FAST, OPTIMIZE_STANDARD, OPTIMIZE_THOROUGH
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from transformers import BitsAndBytesConfig, HqqConfig
+from transformers import BitsAndBytesConfig, HqqConfig, QuantoConfig
 from transformers import Qwen2ForCausalLM
+from hqq.models.hf.base import AutoHQQHFModel
+from hqq.core.quantize import BaseQuantizeConfig
+import hqq
 import torch
 from tqdm import tqdm
 
@@ -24,6 +27,7 @@ import os
 
 DEVICE = "cuda"
 MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"
+QUANTIZED_MODEL = None #"Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4"
 GGUF_FILE = None #"Qwen2.5-1.5B-Instruct-Q8_0_imat.gguf"
 QUANT_CONFIG = BitsAndBytesConfig(
     load_in_8bit=True,
@@ -35,21 +39,24 @@ QUANT_CONFIG = BitsAndBytesConfig(
     bnb_4bit_use_double_quant=True, 
     bnb_4bit_compute_dtype=torch.float16 if DEVICE == "cuda" else torch.float32,
 )
+QUANT_CONFIG = QuantoConfig(weights = "int2")
+QUANT_CONFIG = HqqConfig(nbits=2)
+
 QUANT_CONFIG = {
-    "embed": "Q4L",
+    "embed": "Q3S",
     "attention": {
-        "v": "Q4L",
-        "k": "Q4L",
-        "q": "Q4L",
-        "o": "Q4L",
+        "v": "Q3S",
+        "k": "Q3S",
+        "q": "Q3S",
+        "o": "Q3S",
     },
     "ffn": {
-        "up": "Q4L",
-        "down": "Q4L",
-        "gate": "Q4L",
+        "up": "Q3S",
+        "down": "Q3S",
+        "gate": "Q3S",
     },
-    "output": "Q4L",
-    "optimize": OPTIMIZE_STANDARD
+    "output": "Q3S",
+    "optimize": OPTIMIZE_THOROUGH
 }
 
 def calculate_calibration_matrix(calibration, model):
@@ -74,14 +81,37 @@ def calculate_calibration_matrix(calibration, model):
         if end_loc == seq_len:
             break
 
-def load_quantized_model(model: str, file: str | None, device: str, quant_config: BitsAndBytesConfig | HqqConfig | dict, calibration):
-    if file is not None:
+def load_quantized_model(
+        model: str, 
+        gguf_file: str | None = None, 
+        quantized_model: str | None = None,
+        quant_config: BitsAndBytesConfig | HqqConfig | dict | None = None,
+        calibration = None,
+        device: str = "cuda"
+    ):
+    if gguf_file is not None:
         return AutoModelForCausalLM.from_pretrained(
-            os.path.dirname(file),
-            gguf_file=file,
+            os.path.dirname(gguf_file),
+            gguf_file=gguf_file,
             device_map=device,
             dtype=torch.float16 if device == "cuda" else torch.float32,
         )
+    
+    if quantized_model is not None:
+        return AutoModelForCausalLM.from_pretrained(
+            quantized_model, 
+            device_map=device,
+            dtype=torch.float16 if device == "cuda" else torch.float32,
+        )
+    
+    if type(quant_config) is HqqConfig:
+        model = AutoModelForCausalLM.from_pretrained(
+            model, 
+            device_map=device,
+            dtype=torch.float16 if device == "cuda" else torch.float32,
+        )
+        AutoHQQHFModel.quantize_model(model, quant_config=BaseQuantizeConfig(quant_config.quant_config["weight_quant_params"]["nbits"]))
+        return model
 
     if type(quant_config) is not dict:
         return AutoModelForCausalLM.from_pretrained(
@@ -98,11 +128,9 @@ def load_quantized_model(model: str, file: str | None, device: str, quant_config
     )
 
     if type(model) is Qwen2ForCausalLM:
-       
         usesTiedEmbeddings = torch.equal(model.model.embed_tokens.weight, model.lm_head.weight)
         model.graph_buffer = torch.empty(model.model.layers[0].mlp.gate_proj.weight.nelement(), device="cuda", dtype=torch.float16)
-        model.model.embed_tokens = QuantizedEmbedding(model.model.embed_tokens, quant=quant_config["embed"], optimize=quant_config["optimize"])
-        
+
         for layer in model.model.layers:
             layer.mlp.gate_proj = CalibrationLinear(layer.mlp.gate_proj)
             layer.mlp.up_proj = CalibrationLinear(layer.mlp.up_proj)
@@ -111,13 +139,17 @@ def load_quantized_model(model: str, file: str | None, device: str, quant_config
             layer.self_attn.k_proj = CalibrationLinear(layer.self_attn.k_proj)
             layer.self_attn.v_proj = CalibrationLinear(layer.self_attn.v_proj)
             layer.self_attn.o_proj = CalibrationLinear(layer.self_attn.o_proj)
-        if usesTiedEmbeddings:
-            model.lm_head = QuantizedLinear(model.model.embed_tokens, batches=32, buffer=model.graph_buffer) # The small qwen2 models use tied embeddings
-        else:
-            model.lm_head = CalibrationLinear(model.lm_head)
+        model.lm_head = CalibrationLinear(model.lm_head)
 
         if quant_config["optimize"] != OPTIMIZE_FAST:
             calculate_calibration_matrix(calibration, model)
+
+        model.lm_head = QuantizedLinear(model.lm_head, quant=quant_config["output"], optimize=quant_config["optimize"], batches=32, buffer=model.graph_buffer)
+        model.model.embed_tokens = QuantizedEmbedding(
+            model.lm_head if usesTiedEmbeddings else model.model.embed_tokens, 
+            quant=quant_config["embed"], 
+            optimize=quant_config["optimize"]
+        )
 
         for layer in model.model.layers:
             layer.mlp.gate_proj = QuantizedLinear(layer.mlp.gate_proj, quant=quant_config["ffn"]["gate"], optimize=quant_config["optimize"], buffer=model.graph_buffer)
@@ -127,8 +159,6 @@ def load_quantized_model(model: str, file: str | None, device: str, quant_config
             layer.self_attn.k_proj = QuantizedLinear(layer.self_attn.k_proj, quant=quant_config["attention"]["k"], optimize=quant_config["optimize"], buffer=model.graph_buffer)
             layer.self_attn.v_proj = QuantizedLinear(layer.self_attn.v_proj, quant=quant_config["attention"]["v"], optimize=quant_config["optimize"], buffer=model.graph_buffer)
             layer.self_attn.o_proj = QuantizedLinear(layer.self_attn.o_proj, quant=quant_config["attention"]["o"], optimize=quant_config["optimize"], buffer=model.graph_buffer)
-        if not usesTiedEmbeddings:
-            model.lm_head = QuantizedLinear(model.lm_head, quant=quant_config["output"], optimize=quant_config["optimize"], batches=32, buffer=model.graph_buffer)
 
     return model
 
@@ -155,9 +185,15 @@ calibration = tokenizer(text, return_tensors="pt")
 
 ts = time.perf_counter()
 quantized_model = load_quantized_model(
-    MODEL_ID, GGUF_FILE, DEVICE, QUANT_CONFIG, calibration
+    model=MODEL_ID, 
+    quantized_model=QUANTIZED_MODEL,
+    gguf_file=GGUF_FILE,
+    quant_config=QUANT_CONFIG,
+    calibration=calibration,
+    device=DEVICE,
 )
 te = time.perf_counter()
+cudaAllocated = torch.cuda.memory_allocated()
 
 unquantized_model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID, device_map=DEVICE, dtype=torch.float16 if DEVICE == "cuda" else torch.float32
@@ -166,6 +202,7 @@ unquantized_model = AutoModelForCausalLM.from_pretrained(
 print(f"Quantization time: {te - ts}")
 print(f"Original model size: {get_memory_footprint(unquantized_model)}")
 print(f"Quantized model size: {get_memory_footprint(quantized_model, QUANT_CONFIG)}")
+print(f"Used CUDA memory: {cudaAllocated}")
 
 max_length = 512  # Max length of each generation test
 stride = 128  # Sliding window stride

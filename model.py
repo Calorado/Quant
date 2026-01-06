@@ -32,7 +32,7 @@ def quantize_matrix(input: np.ndarray, config: QuantConfig, optimize: int, calib
     # To keep peak memory usage under control do not 
     # process more than this amount of weights at a time
     WEIGHT_BATCH_SIZE = {
-        OPTIMIZE_FAST: 262144, OPTIMIZE_STANDARD: 65536, OPTIMIZE_THOROUGH: 16384
+        OPTIMIZE_FAST: 524288, OPTIMIZE_STANDARD: 131072, OPTIMIZE_THOROUGH: 16384
     }[optimize]
     rowsPerBatch = min(
         WEIGHT_BATCH_SIZE // input.shape[1], 
@@ -69,39 +69,6 @@ def quantize_matrix(input: np.ndarray, config: QuantConfig, optimize: int, calib
     for thread in threads:
         thread.result()
     return output
-
-class QuantizedEmbedding(torch.nn.Module):
-
-    def __init__(this, embeddings: torch.nn.Embedding, quant: str = "Q4L", optimize: int = OPTIMIZE_FAST):
-        """Initializes a embeddings like module with quantized weights.
-        Args:
-            embeddings: an existing torch.nn.Embedding module which will be quantized
-            quant: method to use for quantization
-            optimize: how much time to spend trying to minimize the quantization error
-        """
-        super().__init__()
-
-        this.shape = embeddings.weight.shape
-        this.device = embeddings.weight.device
-        this.dtype = embeddings.weight.dtype
-        this.quantConfig = QuantConfig(quant)
-        this.quantizedWeights = quantize_matrix(embeddings.weight.cpu().detach().numpy(), this.quantConfig, optimize)
-        if this.device.type == "cuda":
-            this.quantizedWeights = torch.tensor(this.quantizedWeights, dtype=torch.uint8, device="cuda")
-
-    def forward(this, indices: torch.Tensor):
-        if this.device.type == "cpu":
-            weights = dequantize(this.quantizedWeights[indices.detach().numpy()], this.quantConfig)
-            return torch.from_numpy(weights)
-        if this.device.type == "cuda":
-            weights = cu_dequantize(cu.asarray(this.quantizedWeights[indices]), this.quantConfig)
-            return torch.as_tensor(weights, device="cuda")
-    
-    def nelement(this) -> int:
-        return this.shape[0] * this.shape[1]
-
-    def element_size(this) -> float:
-        return this.quantConfig.element_size() / 8
     
 class CalibrationLinear(torch.nn.Module):
     """Class to record activation statistics from a torch.nn.Linear module, and
@@ -138,7 +105,7 @@ class QuantizedLinear(torch.nn.Module):
 
     def __init__(
             this, 
-            module: torch.nn.Linear | QuantizedEmbedding | CalibrationLinear, 
+            module: torch.nn.Linear | CalibrationLinear, 
             quant: str = "Q4L",
             optimize: int = OPTIMIZE_FAST,
             batches: int = 1,
@@ -146,8 +113,8 @@ class QuantizedLinear(torch.nn.Module):
         ):
         """Initializes a linear like module with quantized weights.
         Args:
-            module: an existing torch.nn.Linear module which will be quantized or an existing 
-                QuantizedEmbedding module for models with tied embeddings
+            module: an existing torch.nn.Linear module which will be quantized or a CalibrationLinear
+                object with activation statistics for calibration.
             quant: method to use for quantization. Ignored if a QuantizedEmbedding
                 object is passed as module
             optimize: how much time to spend trying to minimize the quantization error. 
@@ -161,28 +128,20 @@ class QuantizedLinear(torch.nn.Module):
         """
         super().__init__()
 
-        if type(module) is torch.nn.Linear or type(module) is CalibrationLinear:
-            calibration = None
-            if type(module) is CalibrationLinear:
-                calibration = module.get_calibration_matrix()
-                module = module.module # Get the actual torch.nn.Linear module
+        calibration = None
+        if type(module) is CalibrationLinear:
+            calibration = module.get_calibration_matrix()
+            module = module.module # Get the actual torch.nn.Linear module
 
-            this.bias = module.bias # Usually small, not worth quantizing
-            this.shape = module.weight.shape
-            this.device = module.weight.device
-            this.dtype = module.weight.dtype
-            this.quantConfig = QuantConfig(quant)
-            this.quantizedWeights = quantize_matrix(module.weight.numpy(force=True), this.quantConfig, optimize, calibration)
-            if this.device.type == "cuda":
-                this.quantizedWeights = torch.tensor(this.quantizedWeights, dtype=torch.uint8, device="cuda")
-        # Initialize linear layer with the weights from a QuantizedEmbeddings object. Good for models that use tied embeddings.
-        else:
-            this.bias = None
-            this.shape = module.shape
-            this.device = module.device
-            this.dtype = module.dtype
-            this.quantConfig = module.quantConfig
-            this.quantizedWeights = module.quantizedWeights
+        this.bias = module.bias # Usually small, not worth quantizing
+        this.shape = module.weight.shape
+        this.device = module.weight.device
+        this.dtype = module.weight.dtype
+        this.quantConfig = QuantConfig(quant)
+        this.quantizedWeights = quantize_matrix(module.weight.numpy(force=True), this.quantConfig, optimize, calibration)
+        if this.device.type == "cuda":
+            this.quantizedWeights = torch.tensor(this.quantizedWeights, dtype=torch.uint8, device="cuda")
+            this.quantizedWeights = cu.asarray(this.quantizedWeights)
 
         this.batches = batches
         this.buffer = buffer
@@ -191,44 +150,44 @@ class QuantizedLinear(torch.nn.Module):
             this.buffer = cu.asarray(this.buffer) # These will share the underlying memory
         this.graphs = [None] * this.batches # CUDA graphs
 
+    def dequantize_cpu(this, output: np.ndarray, quants: np.ndarray):
+        rowsPerThread = output.shape[0] / PHYSICAL_CORES
+        def dequantize_row(idx: int):
+            srow = round(rowsPerThread * idx)
+            erow = round(rowsPerThread * (idx + 1))
+            if erow == srow: 
+                return
+            output[srow:erow] = dequantize(quants[srow:erow], this.quantConfig)
+        threads = [THREAD_POOL.submit(dequantize_row, idx) for idx in range(PHYSICAL_CORES)]
+        for thread in threads: 
+            thread.result()
+
+    def dequantize_cuda(this, output: cu.ndarray, quants: cu.ndarray, idx: int) -> cu.ndarray:
+        # Apply graphs for a massive reduction in CPU cost
+        if output is not None:
+            if this.graphs[idx] is None:
+                with STREAM:
+                    STREAM.begin_capture()
+                    cu_dequantize(quants, this.quantConfig, out=output)
+                    this.graphs[idx] = STREAM.end_capture()
+            this.graphs[idx].launch(stream=STREAM)
+            STREAM.synchronize()
+            return output
+        # Otherwise dequantize as usual
+        return cu_dequantize(quants, this.quantConfig)
+
     def forward(this, input: torch.Tensor):
-
-        def dequantize_cpu(output: np.ndarray, quants: np.ndarray):
-            rowsPerThread = output.shape[0] / PHYSICAL_CORES
-            def dequantize_row(idx: int):
-                srow = round(rowsPerThread * idx)
-                erow = round(rowsPerThread * (idx + 1))
-                if erow == srow: 
-                    return
-                output[srow:erow] = dequantize(quants[srow:erow], this.quantConfig)
-            threads = [THREAD_POOL.submit(dequantize_row, idx) for idx in range(PHYSICAL_CORES)]
-            for thread in threads: 
-                thread.result()
-
-        def dequantize_cuda(output: cu.ndarray, quants: cu.ndarray, idx: int) -> cu.ndarray:
-            # Apply graphs for a massive reduction in CPU cost
-            if output is not None:
-                if this.graphs[idx] is None:
-                    with STREAM:
-                        STREAM.begin_capture()
-                        cu_dequantize(cu.asarray(quants), this.quantConfig, out=output)
-                        this.graphs[idx] = STREAM.end_capture()
-                this.graphs[idx].launch(stream=STREAM)
-                STREAM.synchronize()
-                return output
-            # Otherwise dequantize as usual
-            return cu_dequantize(cu.asarray(quants), this.quantConfig)
 
         # Compute this module in a single step, as this is faster
         if this.batches == 1:
             if this.device.type == "cpu":
                 weights = np.empty(this.shape, dtype=np.float32)
-                dequantize_cpu(weights, this.quantizedWeights)
+                this.dequantize_cpu(weights, this.quantizedWeights)
                 return torch.nn.functional.linear(input, torch.from_numpy(weights), this.bias)
             
             if this.device.type == "cuda":
-                weights = dequantize_cuda(this.buffer, this.quantizedWeights, 0)
-                return torch.nn.functional.linear(input, torch.as_tensor(weights, device="cuda"), this.bias)
+                weights = this.dequantize_cuda(this.buffer, this.quantizedWeights, 0)
+                return torch.nn.functional.linear(input, torch.as_tensor(weights), this.bias)
         
         # Compute this module in multiple steps, dequantizing only a subset of the weights per step to limit peak memory
         if this.device.type == "cpu":
@@ -238,7 +197,7 @@ class QuantizedLinear(torch.nn.Module):
             for batch in range(this.batches):
                 srow = batch * rowsPerBatch
                 erow = (batch + 1) * rowsPerBatch
-                dequantize_cpu(weights, this.quantizedWeights[srow:erow])
+                this.dequantize_cpu(weights, this.quantizedWeights[srow:erow])
                 torch.matmul(input, torch.from_numpy(weights).T, out=output[..., srow:erow])
         
         if this.device.type == "cuda":
@@ -247,8 +206,8 @@ class QuantizedLinear(torch.nn.Module):
             for batch in range(this.batches):
                 srow = batch * rowsPerBatch
                 erow = (batch + 1) * rowsPerBatch
-                weights = dequantize_cuda(this.buffer, this.quantizedWeights[srow:erow], batch)
-                torch.matmul(input, torch.as_tensor(weights, device="cuda").T, out=output[..., srow:erow])
+                weights = this.dequantize_cuda(this.buffer, this.quantizedWeights[srow:erow], batch)
+                torch.matmul(input, torch.as_tensor(weights).T, out=output[..., srow:erow])
                 
         if this.bias is not None:
             output += this.bias
@@ -257,5 +216,48 @@ class QuantizedLinear(torch.nn.Module):
     def nelement(this) -> int:
         return this.shape[0] * this.shape[1]
     
+    def element_size(this) -> float:
+        return this.quantConfig.element_size() / 8
+    
+class QuantizedEmbedding(torch.nn.Module):
+
+    def __init__(this, module: torch.nn.Embedding | QuantizedLinear, quant: str = "Q4L", optimize: int = OPTIMIZE_FAST):
+        """Initializes an embeddings like module with quantized weights.
+        Args:
+            embeddings: an existing torch.nn.Embedding module which will be quantized or an
+                existing QuantizedLinear module to reuse its weights
+            quant: method to use for quantization
+            optimize: how much time to spend trying to minimize the quantization error
+        """
+        super().__init__()
+
+        if type(module) is torch.nn.Embedding:
+            this.shape = module.weight.shape
+            this.device = module.weight.device
+            this.dtype = module.weight.dtype
+            this.quantConfig = QuantConfig(quant)
+            this.quantizedWeights = quantize_matrix(module.weight.cpu().detach().numpy(), this.quantConfig, optimize)
+            if this.device.type == "cuda":
+                this.quantizedWeights = torch.tensor(this.quantizedWeights, dtype=torch.uint8, device="cuda")
+                this.quantizedWeights = cu.asarray(this.quantizedWeights)
+        else:
+            # Initialize embeddings layer with the weights from a QuantizedLinear object. Good for models that use tied embeddings.
+            this.shape = module.shape
+            this.device = module.device
+            this.dtype = module.dtype
+            this.quantConfig = module.quantConfig
+            this.quantizedWeights = module.quantizedWeights
+
+    def forward(this, indices: torch.Tensor):
+        if this.device.type == "cpu":
+            weights = dequantize(this.quantizedWeights[indices.detach().numpy()], this.quantConfig)
+            return torch.from_numpy(weights)
+        if this.device.type == "cuda":
+            weights = cu_dequantize(this.quantizedWeights[cu.asarray(indices)], this.quantConfig)
+            return torch.as_tensor(weights, device="cuda")
+    
+    def nelement(this) -> int:
+        return this.shape[0] * this.shape[1]
+
     def element_size(this) -> float:
         return this.quantConfig.element_size() / 8
