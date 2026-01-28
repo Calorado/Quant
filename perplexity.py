@@ -43,19 +43,19 @@ QUANT_CONFIG = QuantoConfig(weights = "int2")
 QUANT_CONFIG = HqqConfig(nbits=2)
 
 QUANT_CONFIG = {
-    "embed": "Q3S",
+    "embed": "Q2S",
     "attention": {
-        "v": "Q3S",
-        "k": "Q3S",
-        "q": "Q3S",
-        "o": "Q3S",
+        "v": "Q2S",
+        "k": "Q2S",
+        "q": "Q2S",
+        "o": "Q2S",
     },
     "ffn": {
-        "up": "Q3S",
-        "down": "Q3S",
-        "gate": "Q3S",
+        "up": "Q2S",
+        "down": "Q2S",
+        "gate": "Q2S",
     },
-    "output": "Q3S",
+    "output": "Q2S",
     "optimize": OPTIMIZE_THOROUGH
 }
 

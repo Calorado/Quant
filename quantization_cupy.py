@@ -15,8 +15,6 @@ from quantization import *
 import cupy as cu
 
 CU_FP16_WEIGHT_INT8_VALUES = cu.array(WEIGHT_INT8_VALUES, dtype=np.float16)
-CU_FP16_WEIGHT_INT6_VALUES = cu.array(WEIGHT_INT6_VALUES, dtype=np.float16)
-CU_FP16_WEIGHT_INT5_VALUES = cu.array(WEIGHT_INT5_VALUES, dtype=np.float16)
 """CU_FP16_WEIGHT_INT8_8_VALUES = cu.array([
     WEIGHT_INT8_VALUES.astype(np.float16).view(np.uint16).astype(np.uint32)[i % 256] | \
     WEIGHT_INT8_VALUES.astype(np.float16).view(np.uint16).astype(np.uint32)[i >> 8] << 16 \
@@ -37,13 +35,8 @@ CU_FP16_WEIGHT_INT4_8_VALUES = cu.array([
     WEIGHT_INT4_VALUES.astype(np.float16).view(np.uint16).astype(np.uint32)[i >> 4] << 16 \
         for i in range(256)
 ], dtype=cu.uint32)
-CU_FP16_WEIGHT_INT3_8_VALUES = cu.array([
-    WEIGHT_INT3_VALUES.astype(np.float16).view(np.uint16).astype(np.uint32)[i % 8] | \
-    WEIGHT_INT3_VALUES.astype(np.float16).view(np.uint16).astype(np.uint32)[i >> 3] << 16 \
-        for i in range(64)
-], dtype=cu.uint32)
 
-CU_FP16_WEIGHT_INT4_2D_VALUES = cu.empty((1024), dtype=np.uint32)
+CU_FP16_WEIGHT_INT4_2D_VALUES = cu.empty((1024), dtype=cu.uint32)
 for i in range(1024):
     magnitude, angle, spin = ((i % 256 + 16) // 17, (i % 256 + 16) % 17, i >> 8)
     angle = (angle + magnitude / 2 + spin / 4) / (17 / (2*np.pi))
@@ -51,7 +44,7 @@ for i in range(1024):
     b = (np.sin(angle) * magnitude / 15).astype(np.float16).view(np.uint16).astype(np.uint32)
     CU_FP16_WEIGHT_INT4_2D_VALUES[i] = a | (b << 16)
 
-CU_FP16_WEIGHT_INT3_2D_VALUES = cu.empty((256), dtype=np.uint32)
+CU_FP16_WEIGHT_INT3_2D_VALUES = cu.empty((256), dtype=cu.uint32)
 for i in range(256):
     magnitude, angle, spin = ((i % 64 + 8) // 9, (i % 64 + 8) % 9, i >> 6)
     angle = (angle + magnitude / 2 + spin / 4) / (9 / (2*np.pi))
@@ -59,7 +52,7 @@ for i in range(256):
     b = (np.sin(angle) * magnitude / 7).astype(np.float16).view(np.uint16).astype(np.uint32)
     CU_FP16_WEIGHT_INT3_2D_VALUES[i] = a | (b << 16)
 
-CU_FP16_WEIGHT_INT2_2D_VALUES = cu.empty((256), dtype=np.uint32)
+CU_FP16_WEIGHT_INT2_2D_VALUES = cu.empty((256), dtype=cu.uint32)
 for i in range(256):
     magnitude, angle, spin = ((i % 16 + 4) // 5, (i % 16 + 4) % 5, i >> 6)
     angle = (angle + magnitude / 2 + spin / 4) / (5 / (2*np.pi))
@@ -80,9 +73,6 @@ CU_FP16_SCALE_INT2_8_VALUES = cu.array([
 ], dtype=cu.uint32)
 
 CU_FP16_SCALE_UE5M3_VALUES = cu.array(SCALE_UE5M3_VALUES, dtype=cu.float16)
-CU_FP16_SCALE_SE5M2_VALUES = cu.array(SCALE_SE5M2_VALUES, dtype=cu.float16)
-CU_FP16_SCALE_UE5M1_VALUES_NORM = cu.array(SCALE_UE5M1_VALUES_NORM, dtype=cu.float16)
-CU_FP16_SCALE_UE5M3_VALUES_NORM = cu.array(SCALE_UE5M3_VALUES_NORM, dtype=cu.float16)
 
 def cu_dequantize_nonlinear(quants: cu.ndarray, config: QuantConfig, out: cu.ndarray | None = None) -> cu.ndarray:
     """
@@ -128,10 +118,7 @@ def cu_dequantize_nonlinear(quants: cu.ndarray, config: QuantConfig, out: cu.nda
     # Unpack scales
     superScales = quants[..., -(subBlocks // 2 + superBlocks):-(subBlocks // 2)]
     subScales = quants[..., -(subBlocks // 2):]
-    if config._USE_SIGN():
-        superScales = CU_FP16_SCALE_SE5M2_VALUES[superScales]
-    else:
-        superScales = CU_FP16_SCALE_UE5M3_VALUES[superScales]
+    superScales = CU_FP16_SCALE_UE5M3_VALUES[superScales]
     subScales = CU_FP16_SCALE_INT4_8_VALUES[subScales].view(cu.float16)
     # Use inplace reshape to merge both scale levels
     reshaped = subScales.reshape((-1, config._SUB_BLOCKS_PER_SUPER()))
@@ -142,32 +129,34 @@ def cu_dequantize_nonlinear(quants: cu.ndarray, config: QuantConfig, out: cu.nda
     reshaped *= subScales.reshape((-1, 1))
     return out
 
-def cu_dequantize_2d(quants: cu.ndarray | list, config: QuantConfig, out: cu.ndarray | None = None) -> cu.ndarray:
+def cu_dequantize_2d(quants: cu.ndarray, config: QuantConfig, out: cu.ndarray | None = None) -> cu.ndarray:
     
     # Number of elements in the first dimension
     dims = int(quants.shape[-1] * 8 / config.element_size())
     superBlocks = dims // config._QUANT_SUPER_BLOCK()
     subBlocks = dims // config._QUANT_SUB_BLOCK()
-    if out is None:
-        out = cu.empty((*quants.shape[:-1], dims), dtype=cu.float16)
-
     superScales = quants[..., -(subBlocks // 2 + superBlocks):-(subBlocks // 2)]
-    subScales = quants[..., -(subBlocks // 2):]
+    subInfo = quants[..., -(subBlocks // 2):]
     
-    # Unpack scales
-    spins = cu.concatenate([subScales << 2, subScales], axis=-1) & 0xC0
-    superScales = CU_FP16_SCALE_UE5M3_VALUES_NORM[superScales]
-    subScales = CU_FP16_SCALE_INT2_8_VALUES[subScales].view(cu.float16)
+    # Unpack spins
+    spins = cu.empty((*quants.shape[:-1], subBlocks), dtype=np.uint8 if config._BITS() < 4 else np.uint16)
+    cu.left_shift(subInfo, 2, out=spins[..., :spins.shape[-1] // 2])
+    spins[..., spins.shape[-1] // 2:] = subInfo
+    spins &= 0xC0
 
     # Unpack weights
     eighth = dims // 8
+    if out is None:
+        out = cu.empty((*quants.shape[:-1], dims), dtype=cu.float16)
+        
     if config._BITS() == 4:
+        spins <<= 2
         tmp = quants[..., :eighth * 4].astype(cu.uint16)
         spinMerge = tmp.reshape(-1, config._QUANT_SUB_BLOCK() // 2)
-        spinMerge |= (spins.astype(cu.uint16) << 2).reshape(-1, 1)
+        spinMerge |= spins.reshape(-1, 1)
         cu.take(CU_FP16_WEIGHT_INT4_2D_VALUES, tmp, out=out.view(cu.uint32))
 
-    if config._BITS() == 3:
+    elif config._BITS() == 3:
         # Unpack the 3 bit weights into a single buffer, with 6 bit integers 
         # representing 2 weights, without using temporary arrays
         unpacked = cu.empty((*quants.shape[:-1], dims // 2), dtype=cu.uint8)
@@ -181,7 +170,7 @@ def cu_dequantize_2d(quants: cu.ndarray | list, config: QuantConfig, out: cu.nda
         spinMerge |= spins.reshape(-1, 1)
         cu.take(CU_FP16_WEIGHT_INT3_2D_VALUES, unpacked, out=out.view(cu.uint32))
 
-    if config._BITS() == 2:
+    elif config._BITS() == 2:
         unpacked = cu.empty((*quants.shape[:-1], dims // 2), dtype=cu.uint8)
         cu.bitwise_and(quants[..., :eighth * 2], 0xF, out=unpacked[..., :unpacked.shape[-1]//2])
         cu.right_shift(quants[..., :eighth * 2], 4, out=unpacked[..., unpacked.shape[-1]//2:])
@@ -189,15 +178,15 @@ def cu_dequantize_2d(quants: cu.ndarray | list, config: QuantConfig, out: cu.nda
         spinMerge |= spins.reshape(-1, 1)
         cu.take(CU_FP16_WEIGHT_INT2_2D_VALUES, unpacked, out=out.view(cu.uint32))
 
-    # Use inplace reshape to merge both scale levels
-    outputShape = subScales.shape
-    subScales = subScales.reshape((-1, config._SUB_BLOCKS_PER_SUPER()))
-    subScales *= superScales.reshape((-1, 1))
-    subScales = subScales.reshape(outputShape)
+    # Unpack scales and merge them
+    superScales = CU_FP16_SCALE_UE5M3_VALUES[superScales]
+    subScales = CU_FP16_SCALE_INT2_8_VALUES[subInfo].view(cu.float16)
+    mergedScales = subScales.reshape(-1, config._SUB_BLOCKS_PER_SUPER())
+    mergedScales *= superScales.reshape(-1, 1)
 
     # Use inplace reshape to multiply the elements by their respective scale
-    reshaped = out.reshape((-1, config._QUANT_SUB_BLOCK()))
-    reshaped *= subScales.reshape((-1, 1))
+    reshaped = out.reshape(-1, config._QUANT_SUB_BLOCK())
+    reshaped *= mergedScales.reshape(-1, 1)
     return out
 
 def cu_dequantize(quants: cu.ndarray, config: QuantConfig, out: cu.ndarray | None = None) -> cu.ndarray:
