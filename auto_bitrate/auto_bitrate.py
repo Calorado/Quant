@@ -55,13 +55,13 @@ HIGHEST_QUANT = QUANTIZATIONS["Q8_0"]
 MODE_COARSE = "mode_coarse"
 MODE_MEDIUM = "mode_medium"
 MODE_FINE = "mode_fine"
-COARSE_EPOCHS = 3
-MEDIUM_EPOCHS = 2
 
-def merge_quants(modelReader: GGUFReader, quantReaders: dict[str, GGUFReader], output: str, tensors: list[Tensor]):
+def merge_quants(quantReaders: dict[str, GGUFReader], output: str, tensors: list[Tensor]):
     """Uses the precomputed quantized tensors to generate a new gguf with the given quantization mix"""
-    writer = GGUFWriter(output, modelReader.get_field(gguf.Keys.General.ARCHITECTURE).contents())
-    for field in modelReader.fields.values():
+    # Model to read metadata and unquantized tensors from. Anyone should work.
+    metadataReader = list(quantReaders.values())[0]
+    writer = GGUFWriter(output, metadataReader.get_field(gguf.Keys.General.ARCHITECTURE).contents())
+    for field in metadataReader.fields.values():
         if field.name == gguf.Keys.General.ARCHITECTURE:
             continue # Handled when initializing the writer
         writer.add_key_value(
@@ -73,18 +73,18 @@ def merge_quants(modelReader: GGUFReader, quantReaders: dict[str, GGUFReader], o
 
     tensorDict = { tensors[idx].name: tensors[idx] for idx in range(len(tensors)) }
 
-    for idx in range(len(modelReader.tensors)):
-        if modelReader.tensors[idx].name not in tensorDict:
+    for idx in range(len(metadataReader.tensors)):
+        if metadataReader.tensors[idx].name not in tensorDict:
             writer.add_tensor_info(
-                modelReader.tensors[idx].name, 
-                modelReader.tensors[idx].data.shape, 
-                modelReader.tensors[idx].data.dtype, 
-                modelReader.tensors[idx].data.nbytes, 
-                modelReader.tensors[idx].tensor_type
+                metadataReader.tensors[idx].name, 
+                metadataReader.tensors[idx].data.shape, 
+                metadataReader.tensors[idx].data.dtype, 
+                metadataReader.tensors[idx].data.nbytes, 
+                metadataReader.tensors[idx].tensor_type
             )
             continue
         
-        quantTensor = tensorDict[modelReader.tensors[idx].name].quant.name
+        quantTensor = tensorDict[metadataReader.tensors[idx].name].quant.name
         writer.add_tensor_info(
             quantReaders[quantTensor].tensors[idx].name, 
             quantReaders[quantTensor].tensors[idx].data.shape, 
@@ -97,11 +97,11 @@ def merge_quants(modelReader: GGUFReader, quantReaders: dict[str, GGUFReader], o
     writer.write_kv_data_to_file()
     writer.write_ti_data_to_file()
 
-    for idx in range(len(modelReader.tensors)):
-        if modelReader.tensors[idx].name not in tensorDict:
-            writer.write_tensor_data(modelReader.tensors[idx].data)
+    for idx in range(len(metadataReader.tensors)):
+        if metadataReader.tensors[idx].name not in tensorDict:
+            writer.write_tensor_data(metadataReader.tensors[idx].data)
             continue
-        quantTensor = tensorDict[modelReader.tensors[idx].name].quant.name
+        quantTensor = tensorDict[metadataReader.tensors[idx].name].quant.name
         writer.write_tensor_data(quantReaders[quantTensor].tensors[idx].data)
 
     writer.close()
@@ -120,7 +120,7 @@ def calculate_kld(modelFile: str, logitsFile: str, gpuLayers: int, ctk: str, ctv
 
 def calculate_score(tensors: list[Tensor], currentBPW: float, mode: str) -> tuple[float, float]:
     newBPW = sum([tensor.size * tensor.quant.bpw for tensor in tensors]) / paramCount
-    merge_quants(modelReader, quantReaders, outputFile, tensors)
+    merge_quants(quantReaders, outputFile, tensors)
     kld = calculate_kld(outputFile, calibrationFile, min(maxGPULayers, numLayers), ctk, ctv)
     score = (currentKLD - kld) / abs(newBPW - currentBPW)
     print(f"New KLD: {kld} ; New BPW: {newBPW} ; Score: {score}")
@@ -200,7 +200,9 @@ if len(sys.argv) < 3:
           "-v file: validation file to use (default this script)\n"
           "-i file: imatrix file to use (default this script)\n"
           "-b bits: target bitrate in bits per weight (default 4.0bpw)\n"
-          "-e epochs: number of epochs to train for (default 6)\n"
+          "-ec epochs: number of coarse grained epochs to train for (default 3)\n"
+          "-em epochs: number of medium grained epochs to train for (default 2)\n"
+          "-ef epochs: number of fine grained epochs to train for (default 1)\n"
           "-min quant: do not use quants smaller than this\n"
           "-max quant: do not use quants bigger than this\n"
           "-tensor name=quant: force the given quant for the given tensor\n"
@@ -216,7 +218,9 @@ calibrationFile = __file__
 validationFile = __file__
 imatrixFile = __file__
 targetBPW = 4.0
-epochs = 6
+coarseEpochs = 3
+mediumEpochs = 2
+fineEpochs = 1
 maxGPULayers = 99
 tmpDirectory = f"tmp_{os.path.basename(modelFile)}/"
 minQuant = LOWEST_QUANT
@@ -234,8 +238,12 @@ for argi in range(1, len(sys.argv) - 2, 2):
         imatrixFile = sys.argv[argi + 1]
     elif sys.argv[argi] == "-b":
         targetBPW = float(sys.argv[argi + 1])
-    elif sys.argv[argi] == "-e":
-        epochs = int(sys.argv[argi + 1])
+    elif sys.argv[argi] == "-ec":
+        coarseEpochs = int(sys.argv[argi + 1])
+    elif sys.argv[argi] == "-em":
+        mediumEpochs = int(sys.argv[argi + 1])
+    elif sys.argv[argi] == "-ef":
+        fineEpochs = int(sys.argv[argi + 1])
     elif sys.argv[argi] == "-min":
         minQuant = QUANTIZATIONS[sys.argv[argi + 1]]
     elif sys.argv[argi] == "-max":
@@ -335,7 +343,7 @@ while True:
     currentBPW = sum([tensor.size * tensor.quant.bpw for tensor in tensors]) / paramCount
     # Create the output model from the last epoch
     print(f"\nOutputting quantized model from epoch {len(epochInfo) + 1}")
-    merge_quants(modelReader, quantReaders, outputFile, tensors)
+    merge_quants(quantReaders, outputFile, tensors)
     print(f"Output done")
     print(f"Testing KLD for epoch {len(epochInfo) + 1}")
     currentKLD = calculate_kld(outputFile, calibrationFile, min(maxGPULayers, numLayers), ctk, ctv)
@@ -343,8 +351,8 @@ while True:
     print(f"Current BPW: {currentBPW}\nCurrent KLD: {currentKLD}\nValidation KLD: {validationKLD}\n")
 
     currentEpoch = len(epochInfo)
-    gradMode = MODE_COARSE if currentEpoch < COARSE_EPOCHS \
-          else MODE_MEDIUM if currentEpoch < COARSE_EPOCHS + MEDIUM_EPOCHS \
+    gradMode = MODE_COARSE if currentEpoch < coarseEpochs \
+          else MODE_MEDIUM if currentEpoch < coarseEpochs + mediumEpochs \
           else MODE_FINE
     epochInfo.append({
         "grad": gradMode,
@@ -355,7 +363,8 @@ while True:
     })
     json.dump(epochInfo, open(tmpDirectory + f"epochs_{targetBPW}.json", "w", encoding="utf-8"), indent=4)
     
-    if len(epochInfo) > epochs:
+    # We have finished training
+    if len(epochInfo) > coarseEpochs + mediumEpochs + fineEpochs:
         break
 
     # If for whatever reason the grad mode is changed delete the grad info for the last epoch
@@ -472,7 +481,7 @@ while True:
     if gradMode == MODE_COARSE:
         modifiedTensors = mod_tensors(0)
         # Make sure this actually improves KLD
-        merge_quants(modelReader, quantReaders, outputFile, modifiedTensors)
+        merge_quants(quantReaders, outputFile, modifiedTensors)
         newKLD = calculate_kld(outputFile, calibrationFile, min(maxGPULayers, numLayers), ctk, ctv)
         if newKLD < currentKLD:
             tensors = modifiedTensors
@@ -483,7 +492,7 @@ while True:
         # Test changing quantizations with a few different score thresholds, and keep the best one
         for threshold in [x / 8 for x in range(8)]:
             modifiedTensors = mod_tensors(gradInfo[currentEpoch]["up"][-1]["score"] * threshold)
-            merge_quants(modelReader, quantReaders, outputFile, modifiedTensors)
+            merge_quants(quantReaders, outputFile, modifiedTensors)
             newKLD = calculate_kld(outputFile, calibrationFile, min(maxGPULayers, numLayers), ctk, ctv)
             if newKLD < bestKLD:
                 bestKLD = newKLD

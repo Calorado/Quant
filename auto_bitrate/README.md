@@ -15,6 +15,13 @@ To generate my own quants I used the following command:
 
 ![](quants.png)
 
+I also made a small test with the bigger Qwen3-VL-30BA3B-Instruct. The command used is the same.
+
+| Model        | BPW  | KLD    | Perplexity |
+| ------------ | ---- | ------ | ---------- |
+| Unsloth      | 3.38 | 0.055  | 5.232      |
+| Auto Bitrate | 3.27 | 0.0523 | 5.253      |
+
 # Limitations
 
 - Quantization is very slow. A single run of Qwen3-4B took about 3 hours on my RTX 3070 Ti.
