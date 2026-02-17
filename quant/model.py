@@ -27,7 +27,7 @@ THREAD_POOL = ThreadPoolExecutor(PHYSICAL_CORES)
 # Synchronize with the NULL stream, as that is where we will create the output buffers
 STREAM = cu.cuda.Stream(non_blocking=False)
 
-def quantize_matrix(input: np.ndarray, config: QuantConfig, optimize: int, calibration: np.ndarray | None = None) -> np.ndarray:
+def quantize_matrix(input: np.ndarray, config: QuantConfig, optimize: str, calibration: np.ndarray | None = None) -> np.ndarray:
     # Quantize a 2D matrix using multithreading
     # To keep peak memory usage under control do not 
     # process more than this amount of weights at a time
@@ -43,7 +43,7 @@ def quantize_matrix(input: np.ndarray, config: QuantConfig, optimize: int, calib
     output = np.empty(
         (
             input.shape[0], 
-            int(input.shape[1] * (config.element_size()) / 8)
+            int(input.shape[1] * (config._ELEMENT_SIZE) / 8)
         ), 
         dtype=np.uint8
     )
@@ -90,9 +90,9 @@ class CalibrationLinear(torch.nn.Module):
         this.numPasses += 1
         return this.module(input)
     
-    def get_calibration_matrix(this) -> np.ndarray:
+    def get_calibration_matrix(this) -> np.ndarray | None:
         if this.numPasses == 0:
-            return np.tile(np.ones((1, this.module.weight.shape[-1]), dtype=np.float32), (this.module.weight.shape[0], 1))
+            return None
         return (this.weights / this.numPasses).unsqueeze(0).tile((this.module.weight.shape[0], 1)).numpy()
     
     def nelement(this) -> int:
@@ -107,7 +107,7 @@ class QuantizedLinear(torch.nn.Module):
             this, 
             module: torch.nn.Linear | CalibrationLinear, 
             quant: str = "Q4L",
-            optimize: int = OPTIMIZE_FAST,
+            optimize: str = OPTIMIZE_STANDARD,
             batches: int = 1,
             buffer: torch.Tensor | None = None,
         ):
@@ -217,11 +217,11 @@ class QuantizedLinear(torch.nn.Module):
         return this.shape[0] * this.shape[1]
     
     def element_size(this) -> float:
-        return this.quantConfig.element_size() / 8
+        return this.quantConfig._ELEMENT_SIZE / 8
     
 class QuantizedEmbedding(torch.nn.Module):
 
-    def __init__(this, module: torch.nn.Embedding | QuantizedLinear, quant: str = "Q4L", optimize: int = OPTIMIZE_FAST):
+    def __init__(this, module: torch.nn.Embedding | QuantizedLinear, quant: str = "Q4L", optimize: str = OPTIMIZE_STANDARD):
         """Initializes an embeddings like module with quantized weights.
         Args:
             embeddings: an existing torch.nn.Embedding module which will be quantized or an
@@ -260,4 +260,4 @@ class QuantizedEmbedding(torch.nn.Module):
         return this.shape[0] * this.shape[1]
 
     def element_size(this) -> float:
-        return this.quantConfig.element_size() / 8
+        return this.quantConfig._ELEMENT_SIZE / 8

@@ -12,12 +12,11 @@ If not, see <https://www.gnu.org/licenses/>.
 """
 
 import numpy as np
-from dataclasses import dataclass
 from typing import Literal
 
-OPTIMIZE_FAST = -1
-OPTIMIZE_STANDARD = 0
-OPTIMIZE_THOROUGH = 1
+OPTIMIZE_FAST = "O1"
+OPTIMIZE_STANDARD = "O2"
+OPTIMIZE_THOROUGH = "O3"
 
 WEIGHT_INT8_VALUES = (
     ((np.arange(-128,128)/127)*np.abs(np.arange(-128,128)/127)+2*np.arange(-128,128)/127)/3
@@ -96,66 +95,56 @@ SCALE_INT2_8_VALUES = np.array([
         for i in range(256)
 ])
 
-@dataclass
 class QuantConfig:
-    alg: Literal[
-        "Q8L", "Q8M", "Q8S", 
-        "Q6L", "Q6M", "Q6S", 
-        "Q5L", "Q5M", "Q5S", 
-        "Q4L", "Q4M", "Q4S", 
-        "Q3L", "Q3M", "Q3S"
-    ]
-
-    def element_size(self) -> float:
-        """element size in bits per weight"""
-        return self._BITS() + {"L": 0.5625, "M": 0.3125, "S": 0.1875}[self.alg[2]]
-    
-    def _BITS(self) -> int:
-        return int(self.alg[1])
-    
-    def _USE_NONLINEAR(self) -> bool:
-        return self._BITS() >= 5
-    
-    def _QUANT_SUPER_BLOCK(self) -> int:
-        return 128
-
-    def _QUANT_SUB_BLOCK(self) -> int:
-        return {"L": 8, "M": 16, "S": 32}[self.alg[2]]
-    
-    def _SUB_BLOCKS_PER_SUPER(self) -> int:
-        return self._QUANT_SUPER_BLOCK() // self._QUANT_SUB_BLOCK()
+    def __init__(
+            this, 
+            alg: Literal[
+                "Q8L", "Q8M", "Q8S", 
+                "Q6L", "Q6M", "Q6S", 
+                "Q5L", "Q5M", "Q5S", 
+                "Q4L", "Q4M", "Q4S", 
+                "Q3L", "Q3M", "Q3S"
+            ]
+        ):
+        this.alg = alg
+        this._BITS = int(this.alg[1])
+        this._ELEMENT_SIZE = this._BITS + {"L": 0.5625, "M": 0.3125, "S": 0.1875}[this.alg[2]]
+        this._NONLINEAR = this._BITS >= 5
+        this._SUPER_BLOCK = 128
+        this._SUB_BLOCK = {"L": 8, "M": 16, "S": 32}[this.alg[2]]
+        this._SUB_BLOCKS_PER_SUPER = this._SUPER_BLOCK // this._SUB_BLOCK
 
 def dequantize_nonlinear(quants: np.ndarray | list, config: QuantConfig) -> np.ndarray:
     
     if type(quants) is not np.ndarray: # Convert to ndarray if needed
         quants = np.array(quants, dtype=np.uint8)
     # Number of elements in the first dimension
-    dims = int(quants.shape[-1] * 8 / config.element_size())
+    dims = int(quants.shape[-1] * 8 / config._ELEMENT_SIZE)
 
     # Unpack scales
-    superBlocks = dims // config._QUANT_SUPER_BLOCK()
-    subBlocks = dims // config._QUANT_SUB_BLOCK()
+    superBlocks = dims // config._SUPER_BLOCK
+    subBlocks = dims // config._SUB_BLOCK
     superScales = quants[..., -(subBlocks // 2 + superBlocks):-(subBlocks // 2)]
     subScales = quants[..., -(subBlocks // 2):]
 
     superScales = SCALE_UE5M3_VALUES[superScales]
     subScales = SCALE_INT4_8_VALUES[subScales].view(np.float32)
     # Use inplace reshape to merge both scale levels
-    mergedScales = subScales.reshape(-1, config._SUB_BLOCKS_PER_SUPER())
+    mergedScales = subScales.reshape(-1, config._SUB_BLOCKS_PER_SUPER)
     mergedScales *= superScales.reshape(-1, 1)
     
     # Unpack weights
-    eighth = superBlocks * config._QUANT_SUPER_BLOCK() // 8
-    if config._BITS() == 8:
+    eighth = superBlocks * config._SUPER_BLOCK // 8
+    if config._BITS == 8:
         quants = WEIGHT_INT8_8_VALUES[quants[..., :eighth * 8].view(np.uint16)].view(np.float32)
-    elif config._BITS() == 6:
+    elif config._BITS == 6:
         scratch = np.empty(quants[..., eighth * 4:eighth * 6].shape, dtype=np.uint8)
         unpacked = quants[..., :eighth * 4].astype(np.uint16)
         unpacked <<= 4
         unpacked[..., :eighth * 2] |= np.bitwise_and(quants[..., eighth * 4:eighth * 6], 0xF, out=scratch)
         unpacked[..., eighth * 2:] |= np.right_shift(quants[..., eighth * 4:eighth * 6], 4, out=scratch)
         quants = WEIGHT_INT6_8_VALUES[unpacked].view(np.float32)
-    elif config._BITS() == 5:
+    elif config._BITS == 5:
         unpacked = quants[..., :eighth * 4].astype(np.uint16)
         unpacked <<= 2
         scratch = np.empty(quants[..., :eighth].shape, dtype=np.uint8)
@@ -167,12 +156,12 @@ def dequantize_nonlinear(quants: np.ndarray | list, config: QuantConfig) -> np.n
             np.bitwise_and(np.right_shift(rest, 2, out=scratch), 3, out=scratch)
         unpacked[..., eighth * 3:] |= np.bitwise_and(rest, 3, out=scratch)
         quants = WEIGHT_INT5_8_VALUES[unpacked].view(np.float32)
-    elif config._BITS() == 4:
+    elif config._BITS == 4:
         quants = quants[..., :eighth * 4]
         quants = WEIGHT_INT4_8_VALUES[quants].view(np.float32)
 
     # Use inplace reshape to multiply the elements by their respective scale
-    reshaped = quants.reshape((-1, config._QUANT_SUB_BLOCK()))
+    reshaped = quants.reshape((-1, config._SUB_BLOCK))
     reshaped *= subScales.reshape((-1, 1))
     return quants
 
@@ -181,30 +170,30 @@ def dequantize_2d(quants: np.ndarray | list, config: QuantConfig) -> np.ndarray:
     if type(quants) is not np.ndarray: # Convert to ndarray if needed
         quants = np.array(quants, dtype=np.uint8)
     # Number of elements in the first dimension
-    dims = int(quants.shape[-1] * 8 / config.element_size())
+    dims = int(quants.shape[-1] * 8 / config._ELEMENT_SIZE)
 
     # Unpack scales
-    superBlocks = dims // config._QUANT_SUPER_BLOCK()
-    subBlocks = dims // config._QUANT_SUB_BLOCK()
+    superBlocks = dims // config._SUPER_BLOCK
+    subBlocks = dims // config._SUB_BLOCK
     superScales = quants[..., -(subBlocks // 2 + superBlocks):-(subBlocks // 2)]
     subInfo = quants[..., -(subBlocks // 2):]
 
     # Unpack spins
-    spins = np.empty((*quants.shape[:-1], subBlocks), dtype=np.uint8 if config._BITS() < 4 else np.uint16)
+    spins = np.empty((*quants.shape[:-1], subBlocks), dtype=np.uint8 if config._BITS < 4 else np.uint16)
     np.left_shift(subInfo, 2, out=spins[..., :spins.shape[-1] // 2])
     spins[..., spins.shape[-1] // 2:] = subInfo
     spins &= 0xC0
 
     # Unpack weights
     eighth = dims // 8
-    if config._BITS() == 4:
+    if config._BITS == 4:
         spins <<= 2
         tmp = quants[..., :eighth * 4].astype(np.uint16)
-        spinMerge = tmp.reshape(-1, config._QUANT_SUB_BLOCK() // 2)
+        spinMerge = tmp.reshape(-1, config._SUB_BLOCK // 2)
         spinMerge |= spins.reshape(-1, 1)
         quants = WEIGHT_INT4_2D_VALUES[tmp].view(np.float32)
 
-    elif config._BITS() == 3:
+    elif config._BITS == 3:
         # Unpack the 3 bit weights into a single buffer, with 6 bit integers 
         # representing 2 weights, without using temporary arrays
         unpacked = np.empty((*quants.shape[:-1], dims // 2), dtype=np.uint8)
@@ -214,26 +203,26 @@ def dequantize_2d(quants: np.ndarray | list, config: QuantConfig) -> np.ndarray:
         unpacked[..., eighth * 2:eighth * 3] <<= 4
         unpacked[..., :eighth] |= unpacked[..., eighth * 2:eighth * 3]
         np.right_shift(quants[..., :eighth * 3], 2, out=unpacked[..., eighth:])
-        spinMerge = unpacked.reshape(-1, config._QUANT_SUB_BLOCK() // 2)
+        spinMerge = unpacked.reshape(-1, config._SUB_BLOCK // 2)
         spinMerge |= spins.reshape(-1, 1)
         quants = WEIGHT_INT3_2D_VALUES[unpacked].view(np.float32)
         
-    elif config._BITS() == 2:
+    elif config._BITS == 2:
         unpacked = np.empty((*quants.shape[:-1], dims // 2), dtype=np.uint8)
         np.bitwise_and(quants[..., :eighth * 2], 0xF, out=unpacked[..., :unpacked.shape[-1]//2])
         np.right_shift(quants[..., :eighth * 2], 4, out=unpacked[..., unpacked.shape[-1]//2:])
-        spinMerge = unpacked.reshape(-1, config._QUANT_SUB_BLOCK() // 2)
+        spinMerge = unpacked.reshape(-1, config._SUB_BLOCK // 2)
         spinMerge |= spins.reshape(-1, 1)
         quants = WEIGHT_INT2_2D_VALUES[unpacked].view(np.float32)
 
     # Unpack scales and merge them
     superScales = SCALE_UE5M3_VALUES[superScales]
     subScales = SCALE_INT2_8_VALUES[subInfo].view(np.float32)
-    mergedScales = subScales.reshape(-1, config._SUB_BLOCKS_PER_SUPER())
+    mergedScales = subScales.reshape(-1, config._SUB_BLOCKS_PER_SUPER)
     mergedScales *= superScales.reshape(-1, 1)
 
     # Use inplace reshape to multiply the elements by their respective scale
-    reshaped = quants.reshape(-1, config._QUANT_SUB_BLOCK())
+    reshaped = quants.reshape(-1, config._SUB_BLOCK)
     reshaped *= mergedScales.reshape(-1, 1)
     return quants
 
@@ -244,12 +233,12 @@ def dequantize(quants: np.ndarray | list, config: QuantConfig) -> np.ndarray:
         quants: quantized vector or matrix
         config: configuration used for quantizing the data
     """
-    if config._USE_NONLINEAR():
+    if config._NONLINEAR:
         return dequantize_nonlinear(quants, config)
     return dequantize_2d(quants, config)
 
 def quantize_nonlinear(
-        data: list[float] | np.ndarray, config: QuantConfig, optimize: int = OPTIMIZE_FAST, calibration: np.ndarray | None = None
+        data: list[float] | np.ndarray, config: QuantConfig, optimize: str = OPTIMIZE_FAST, calibration: np.ndarray | None = None
     ) -> np.ndarray:
 
     # Convert input data into numpy array if needed
@@ -266,12 +255,12 @@ def quantize_nonlinear(
             calibration = calibration.flatten()
 
     # Variables initialization
-    qtypeMin = -(1 << config._BITS() - 1)
-    qtypeMax = (1 << config._BITS() - 1) - 1
-    numSuperBlocks = len(data) // config._QUANT_SUPER_BLOCK()
-    numSubBlocks = len(data) // config._QUANT_SUB_BLOCK()
+    qtypeMin = -(1 << config._BITS - 1)
+    qtypeMax = (1 << config._BITS - 1) - 1
+    numSuperBlocks = len(data) // config._SUPER_BLOCK
+    numSubBlocks = len(data) // config._SUB_BLOCK
     superBiases = np.full((numSuperBlocks), 0.0, dtype=np.float32)
-    subBiases = np.full((numSubBlocks), {8: 0.45, 6: 0.35, 5: 0.2, 4: 0.0}[config._BITS()], dtype=np.float32)
+    subBiases = np.full((numSubBlocks), {8: 0.45, 6: 0.35, 5: 0.2, 4: 0.0}[config._BITS], dtype=np.float32)
     superBlockErrors = [1e10] * numSuperBlocks
 
     def pack(data: np.ndarray, bits: int) -> np.ndarray:
@@ -313,9 +302,9 @@ def quantize_nonlinear(
         quants = quants.astype(np.uint8)
         superScales = superScales.astype(np.uint8)
         subScales = subScales.astype(np.uint8)
-        quants += 1 << config._BITS() - 1
+        quants += 1 << config._BITS - 1
         subScales -= 1
-        return np.concatenate([pack(quants, config._BITS()), superScales, pack(subScales, 4)], axis=-1)
+        return np.concatenate([pack(quants, config._BITS), superScales, pack(subScales, 4)], axis=-1)
     
     def quantize_internal_step(
             data: np.ndarray, superBias: np.ndarray, subBias: np.ndarray, tiling: int = 1
@@ -328,9 +317,9 @@ def quantize_nonlinear(
         # to test multiples biases for optimization we know that the maximums will 
         # also be tiled.
         absolutes = np.abs(data)
-        subMaximums = absolutes.reshape((-1, config._QUANT_SUB_BLOCK()))
+        subMaximums = absolutes.reshape((-1, config._SUB_BLOCK))
         subMaximums = np.max(subMaximums, axis=1)
-        superMaximums = subMaximums.reshape((-1, config._SUB_BLOCKS_PER_SUPER()))
+        superMaximums = subMaximums.reshape((-1, config._SUB_BLOCKS_PER_SUPER))
         superMaximums = np.max(superMaximums, axis=1)
         if tiling != 1:  # Tile the maximums and input data
             subMaximums = np.tile(subMaximums, tiling)
@@ -346,24 +335,24 @@ def quantize_nonlinear(
 
         # Second level quantization
         unpackedScales /= SUB_SCALES_INT4_BINS
-        normSubMaximums = subMaximums.reshape(-1, config._SUB_BLOCKS_PER_SUPER())
+        normSubMaximums = subMaximums.reshape(-1, config._SUB_BLOCKS_PER_SUPER)
         normSubMaximums /= unpackedScales.reshape(-1, 1)
         subMaximums += subBias
         np.rint(subMaximums, out=subMaximums)
         subScales = np.clip(subMaximums, 1, SUB_SCALES_INT4_BINS, out=subMaximums)
 
         # Mix both scales for weight normalization
-        mergedScales = subScales.reshape(-1, config._SUB_BLOCKS_PER_SUPER())
+        mergedScales = subScales.reshape(-1, config._SUB_BLOCKS_PER_SUPER)
         mergedScales = mergedScales * unpackedScales.reshape(-1, 1)
         mergedScales = mergedScales.reshape(subScales.shape)
 
         # Normalize weights for later quantization
         if tiling != 1:
-            quants = np.tile(data, tiling).reshape(-1, config._QUANT_SUB_BLOCK())
+            quants = np.tile(data, tiling).reshape(-1, config._SUB_BLOCK)
             quants = np.divide(quants, mergedScales.reshape(-1, 1), out=quants)
             quants = np.abs(quants, out=quants)
         else:
-            quants = absolutes.reshape(-1, config._QUANT_SUB_BLOCK())
+            quants = absolutes.reshape(-1, config._SUB_BLOCK)
             quants = np.divide(quants, mergedScales.reshape(-1, 1), out=quants)
         quants = quants.reshape((data.shape[0] * tiling))
         
@@ -381,14 +370,14 @@ def quantize_nonlinear(
     # to find a better quantization by testing different biases for it.
     if optimize != OPTIMIZE_FAST:
 
-        superBiasRange = [
-            [None, None, (  1, 3), ( 0, 2), ( 0, 1), ( 0, 1), ( 0, 1), None, ( 0, 1)],
-            [None, None, (-12,12), (-2, 2), (-2, 3), (-1, 4), (-1, 4), None, ( 0, 5)],
-        ][optimize][config._BITS()]
-        subBiasRange = [
-            [None, None, ( -4, 1), (-2, 1), (-3, 2), (-1, 4), (-1, 4), None, ( 0, 5)],
-            [None, None, (-16,16), (-7, 6), (-3, 5), (-1, 8), (-1, 8), None, ( 0,10)],
-        ][optimize][config._BITS()]
+        superBiasRange = {
+            OPTIMIZE_STANDARD: [None, None, (  1, 3), ( 0, 2), ( 0, 1), ( 0, 1), ( 0, 1), None, ( 0, 1)],
+            OPTIMIZE_THOROUGH: [None, None, (-12,12), (-2, 2), (-2, 3), (-1, 4), (-1, 4), None, ( 0, 5)],
+        }[optimize][config._BITS]
+        subBiasRange = {
+            OPTIMIZE_STANDARD: [None, None, ( -4, 1), (-2, 1), (-3, 2), (-1, 4), (-1, 4), None, ( 0, 5)],
+            OPTIMIZE_THOROUGH: [None, None, (-16,16), (-7, 6), (-3, 5), (-1, 8), (-1, 8), None, ( 0,10)],
+        }[optimize][config._BITS]
         
         superBiasLength = superBiasRange[1] - superBiasRange[0]
         subBiasLength = subBiasRange[1] - subBiasRange[0]
@@ -406,7 +395,7 @@ def quantize_nonlinear(
         
         # Dequantization computations
         quants = np.clip(quants, qtypeMin, qtypeMax, out=quants)
-        quants *= 1 / ((1 << config._BITS() - 1) - 1)
+        quants *= 1 / ((1 << config._BITS - 1) - 1)
         # Unpack weights. x^2 + 2x keeping sign
         dequantized = np.abs(quants)
         np.multiply(dequantized, quants, out=dequantized)
@@ -416,7 +405,7 @@ def quantize_nonlinear(
         
         # Finish by applying the scales
         mergedScales *= 0.33333
-        output = dequantized.reshape(-1, config._QUANT_SUB_BLOCK())
+        output = dequantized.reshape(-1, config._SUB_BLOCK)
         output *= mergedScales.reshape(-1, 1)
 
         mse = dequantized.reshape(-1, len(data))
@@ -427,7 +416,7 @@ def quantize_nonlinear(
         
         # Find optimal block roundings
         # Test all subbiases at the same to reduce computation time
-        mse = mse.reshape(-1, config._QUANT_SUB_BLOCK()).sum(axis=1)
+        mse = mse.reshape(-1, config._SUB_BLOCK).sum(axis=1)
         mse = mse.reshape((superBiasLength, subBiasLength, numSubBlocks))
         # Find which bias had the lowest error for each subblock in each superblock
         optimalSubBiases = np.argmin(mse, axis=1)
@@ -443,8 +432,8 @@ def quantize_nonlinear(
                     superBiases[block] = biasIdx + superBiasRange[0]
                     superBlockErrors[block] = biasMse[biasIdx][block]
                     # Overwrite subbiases
-                    start = block * config._SUB_BLOCKS_PER_SUPER()
-                    end = start + config._SUB_BLOCKS_PER_SUPER()
+                    start = block * config._SUB_BLOCKS_PER_SUPER
+                    end = start + config._SUB_BLOCKS_PER_SUPER
                     subBiases[start:end] = optimalSubBiases[biasIdx][start:end]
 
     quants, superScales, subScales, _ = quantize_internal_step(data, superBiases, subBiases)
@@ -460,7 +449,7 @@ def quantize_nonlinear(
     )
 
 def quantize_2d(
-        data: list[float] | np.ndarray, config: QuantConfig, optimize: int = OPTIMIZE_FAST, calibration: np.ndarray | None = None
+        data: list[float] | np.ndarray, config: QuantConfig, optimize: str = OPTIMIZE_FAST, calibration: np.ndarray | None = None
     ) -> np.ndarray:
 
     # Convert input data into numpy array if needed
@@ -479,11 +468,11 @@ def quantize_2d(
             axisCalibration = (calibration[0::2], calibration[1::2])
 
     # Other variables initialization
-    bitValues = 1 << config._BITS()
-    numSuperBlocks = len(data) // config._QUANT_SUPER_BLOCK()
-    numSubBlocks = len(data) // config._QUANT_SUB_BLOCK()
+    bitValues = 1 << config._BITS
+    numSuperBlocks = len(data) // config._SUPER_BLOCK
+    numSubBlocks = len(data) // config._SUB_BLOCK
     superBiases = np.full((numSuperBlocks), 0.5, dtype=np.float32)
-    subBiases = np.full((numSubBlocks), {4: -0.1, 3: -0.25, 2: -0.4}[config._BITS()], dtype=np.float32)
+    subBiases = np.full((numSubBlocks), {4: -0.1, 3: -0.25, 2: -0.4}[config._BITS], dtype=np.float32)
     bestSpins = np.empty((numSubBlocks), dtype=np.float32)
     superBlockErrors = [1e10] * numSuperBlocks
     anglesStep = (2 * np.pi) / (bitValues + 1)  # constant scalar
@@ -501,9 +490,9 @@ def quantize_2d(
     axisSin = axis1 / magnitudes
 
     # Scales are the max absolute value of the magnitudes of each block. 
-    subMaximums = magnitudes.reshape(-1, config._QUANT_SUB_BLOCK() // 2)
+    subMaximums = magnitudes.reshape(-1, config._SUB_BLOCK // 2)
     subMaximums = np.max(subMaximums, axis=1)
-    superMaximums = subMaximums.reshape(-1, config._SUB_BLOCKS_PER_SUPER())
+    superMaximums = subMaximums.reshape(-1, config._SUB_BLOCKS_PER_SUPER)
     superMaximums = np.max(superMaximums, axis=1)
 
     # Precompute operations for the quantization of angles and magnitudes
@@ -526,14 +515,14 @@ def quantize_2d(
 
         # Pack quantized magnitudes and angles into the final dtype
         quants = np.maximum(magnitudes * (bitValues + 1) + angles - bitValues, 0)
-        quants = quants.astype(np.uint8 if config._BITS() <= 4 else np.uint16)
+        quants = quants.astype(np.uint8 if config._BITS <= 4 else np.uint16)
         subScales = (subScales - 1).astype(np.uint8)
 
         spins = (spins * 4).astype(np.uint8)
         packedSubScales = subScales[..., 0::2] | (subScales[..., 1::2] << 2)
         packedSubScales |= spins[..., :spins.shape[-1] // 2] << 4
         packedSubScales |= spins[..., spins.shape[-1] // 2:] << 6
-        return np.concatenate([pack(quants, config._BITS() * 2), superScales, packedSubScales], axis=-1).astype(np.uint8)
+        return np.concatenate([pack(quants, config._BITS * 2), superScales, packedSubScales], axis=-1).astype(np.uint8)
     
     def quantize_internal(
             magnitudes: np.ndarray, 
@@ -564,14 +553,14 @@ def quantize_2d(
         if tiling != 1:
             subScales = np.tile(subScales, tiling)
         unpackedScales /= SUB_SCALES_INT2_BINS
-        normSubMaximums = subScales.reshape(-1, config._SUB_BLOCKS_PER_SUPER())
+        normSubMaximums = subScales.reshape(-1, config._SUB_BLOCKS_PER_SUPER)
         normSubMaximums /= unpackedScales.reshape(-1, 1)
         subScales += subBias
         np.ceil(subScales, out=subScales)
         subScales = np.clip(subScales, 1, SUB_SCALES_INT2_BINS, out=subScales)
 
         # Mix both scales for magnitude normalization
-        mergedScales = subScales.reshape(-1, config._SUB_BLOCKS_PER_SUPER())
+        mergedScales = subScales.reshape(-1, config._SUB_BLOCKS_PER_SUPER)
         mergedScales = mergedScales * unpackedScales.reshape(-1, 1)
         mergedScales = mergedScales.reshape(subScales.shape)
 
@@ -579,7 +568,7 @@ def quantize_2d(
         if tiling != 1:
             magnitudes = np.tile(magnitudes, tiling)
         outputShape = magnitudes.shape
-        magnitudes = magnitudes.reshape(-1, config._QUANT_SUB_BLOCK() // 2)
+        magnitudes = magnitudes.reshape(-1, config._SUB_BLOCK // 2)
         magnitudes /= mergedScales.reshape(-1, 1)
         magnitudes = magnitudes.reshape(outputShape)
 
@@ -597,7 +586,7 @@ def quantize_2d(
         # Quantize the angles
         if tiling != 1:
             angles = np.tile(angles, tiling)
-        anglesShift = magnitudes.reshape(-1, config._QUANT_SUB_BLOCK() // 2) * 0.5
+        anglesShift = magnitudes.reshape(-1, config._SUB_BLOCK // 2) * 0.5
         anglesShift += spins.reshape(-1, 1)
         anglesShift = anglesShift.reshape(magnitudes.shape)
         angles0 = np.subtract(angles, anglesShift, out=angles)
@@ -651,14 +640,14 @@ def quantize_2d(
     # to find a better quantization by testing different biases for it.
     if optimize != OPTIMIZE_FAST:
 
-        superBiasRange = [
-            [None, None, ( 0, 1), ( 0, 1), ( 0, 1), ( 0, 1), ( 0, 1), None, ( 0, 1)],
-            [None, None, (-3, 3), (-1, 4), (-1, 4), (-1, 4), (-1, 4), None, (-1, 4)],
-        ][optimize][config._BITS()]
-        subBiasRange = [
-            [None, None, (-1, 1), (-1, 1), (-1, 1), (-1, 1), (-1, 1), None, (-1, 1)],
-            [None, None, (-1, 2), (-1, 2), (-1, 2), (-1, 2), (-1, 2), None, (-1, 2)],
-        ][optimize][config._BITS()]
+        superBiasRange = {
+            OPTIMIZE_STANDARD: [None, None, ( 0, 1), ( 0, 1), ( 0, 1), ( 0, 1), ( 0, 1), None, ( 0, 1)],
+            OPTIMIZE_THOROUGH: [None, None, (-3, 3), (-1, 4), (-1, 4), (-1, 4), (-1, 4), None, (-1, 4)],
+        }[optimize][config._BITS]
+        subBiasRange = {
+            OPTIMIZE_STANDARD: [None, None, (-1, 1), (-1, 1), (-1, 1), (-1, 1), (-1, 1), None, (-1, 1)],
+            OPTIMIZE_THOROUGH: [None, None, (-1, 2), (-1, 2), (-1, 2), (-1, 2), (-1, 2), None, (-1, 2)],
+        }[optimize][config._BITS]
 
         superBiasLength = superBiasRange[1] - superBiasRange[0]
         subBiasLength = subBiasRange[1] - subBiasRange[0]
@@ -678,24 +667,24 @@ def quantize_2d(
         values += outAngles
         values -= bitValues
         np.maximum(values, 0, out=values)
-        values = values.astype(np.uint16 if config._BITS() >= 4 else np.uint8)
+        values = values.astype(np.uint16 if config._BITS >= 4 else np.uint8)
         # Convert spins to int and combine them with the rest for a table lookup
-        spins *= [None, 256, 256, 256, 1024, 4096, 16384, None, 262144][config._BITS()]
+        spins *= [None, 256, 256, 256, 1024, 4096, 16384, None, 262144][config._BITS]
 
-        if config._BITS() == 4:
-            merged = values.reshape(-1, config._QUANT_SUB_BLOCK() // 2)
+        if config._BITS == 4:
+            merged = values.reshape(-1, config._SUB_BLOCK // 2)
             merged |= spins.astype(np.uint16).reshape(-1, 1)
             dequantized = WEIGHT_INT4_2D_VALUES[values].view(np.float32)
-        elif config._BITS() == 3:
-            merged = values.reshape(-1, config._QUANT_SUB_BLOCK() // 2)
+        elif config._BITS == 3:
+            merged = values.reshape(-1, config._SUB_BLOCK // 2)
             merged |= spins.astype(np.uint8).reshape(-1, 1)
             dequantized = WEIGHT_INT3_2D_VALUES[values].view(np.float32)
-        elif config._BITS() == 2:
-            merged = values.reshape(-1, config._QUANT_SUB_BLOCK() // 2)
+        elif config._BITS == 2:
+            merged = values.reshape(-1, config._SUB_BLOCK // 2)
             merged |= spins.astype(np.uint8).reshape(-1, 1)
             dequantized = WEIGHT_INT2_2D_VALUES[values].view(np.float32)
 
-        scaled = dequantized.reshape(-1, config._QUANT_SUB_BLOCK())
+        scaled = dequantized.reshape(-1, config._SUB_BLOCK)
         scaled *= mergedScales.reshape(-1, 1)
 
         # Compute quantization error
@@ -704,7 +693,7 @@ def quantize_2d(
         if calibration is not None:
             calibrated = mse.reshape(-1, len(calibration))
             calibrated *= calibration
-        mse = mse.reshape(-1, config._QUANT_SUB_BLOCK()).sum(axis=1)
+        mse = mse.reshape(-1, config._SUB_BLOCK).sum(axis=1)
 
         # Find optimal block roundings
         # Test all subbiases at the same to reduce computation time
@@ -725,8 +714,8 @@ def quantize_2d(
                     superBiases[block] = biasIdx + superBiasRange[0] 
                     superBlockErrors[block] = biasMse[biasIdx][block]
                     # Also overwrite subbiases
-                    start = block * config._SUB_BLOCKS_PER_SUPER()
-                    end = (block + 1) * config._SUB_BLOCKS_PER_SUPER()
+                    start = block * config._SUB_BLOCKS_PER_SUPER
+                    end = (block + 1) * config._SUB_BLOCKS_PER_SUPER
                     subBiases[start:end] = optimalSubBiases[biasIdx][start:end]
                     bestSpins[start:end] = optimalSpins[biasIdx][start:end]
 
@@ -737,8 +726,8 @@ def quantize_2d(
             calibrated = axisCalibration[0] + axisCalibration[1]
             calibrated *= magnitudes 
 
-        indexes = np.argmax(calibrated.reshape(-1, config._QUANT_SUB_BLOCK() // 2), axis=-1)
-        indexes += np.arange(0, len(angles), config._QUANT_SUB_BLOCK() // 2, dtype=np.int64)
+        indexes = np.argmax(calibrated.reshape(-1, config._SUB_BLOCK // 2), axis=-1)
+        indexes += np.arange(0, len(angles), config._SUB_BLOCK // 2, dtype=np.int64)
         bestSpins = angles[indexes]
 
         scratch = np.empty(bestSpins.shape, dtype=np.float32)
@@ -766,8 +755,8 @@ def quantize_2d(
     )
 
 def quantize(
-        data: list[float] | np.ndarray, config: QuantConfig, optimize: int = OPTIMIZE_FAST, calibration: np.ndarray | None = None
+        data: list[float] | np.ndarray, config: QuantConfig, optimize: str = OPTIMIZE_FAST, calibration: np.ndarray | None = None
     ) -> np.ndarray:
-    if config._USE_NONLINEAR():
+    if config._NONLINEAR:
         return quantize_nonlinear(data, config, optimize, calibration)
     return quantize_2d(data, config, optimize, calibration)

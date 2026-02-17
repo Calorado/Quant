@@ -75,32 +75,26 @@ CU_FP16_SCALE_INT2_8_VALUES = cu.array([
 CU_FP16_SCALE_UE5M3_VALUES = cu.array(SCALE_UE5M3_VALUES, dtype=cu.float16)
 
 def cu_dequantize_nonlinear(quants: cu.ndarray, config: QuantConfig, out: cu.ndarray | None = None) -> cu.ndarray:
-    """
-    Returns a quantized embedding vector back to floats
-    Params:
-        quants: quantized vector or matrix
-        config: configuration used for quantizing the data
-    """
     
     # Number of elements in the first dimension
-    dims = int(quants.shape[-1] * 8 / config.element_size())
-    superBlocks = dims // config._QUANT_SUPER_BLOCK()
-    subBlocks = dims // config._QUANT_SUB_BLOCK()
+    dims = int(quants.shape[-1] * 8 / config._ELEMENT_SIZE)
+    superBlocks = dims // config._SUPER_BLOCK
+    subBlocks = dims // config._SUB_BLOCK
     if out is None:
         out = cu.empty((*quants.shape[:-1], dims), dtype=cu.float16)
 
     # Unpack weights
     eighth = dims // 8
-    if config._BITS() == 8:
+    if config._BITS == 8:
         cu.take(CU_FP16_WEIGHT_INT8_VALUES, quants[..., :eighth * 8], out=out)
-    elif config._BITS() == 6:
+    elif config._BITS == 6:
         scratch = cu.empty(quants[..., eighth * 4:eighth * 6].shape, dtype=cu.uint8)
         unpacked = quants[..., :eighth * 4].astype(cu.uint16)
         unpacked <<= 4
         unpacked[..., :eighth * 2] |= cu.bitwise_and(quants[..., eighth * 4:eighth * 6], 0xF, out=scratch)
         unpacked[..., eighth * 2:] |= cu.right_shift(quants[..., eighth * 4:eighth * 6], 4, out=scratch)
         cu.take(CU_FP16_WEIGHT_INT6_8_VALUES, unpacked, out=out.view(cu.uint32))
-    elif config._BITS() == 5:
+    elif config._BITS == 5:
         unpacked = quants[..., :eighth * 4].astype(cu.uint16)
         unpacked <<= 2
         scratch = cu.empty(quants[..., :eighth].shape, dtype=cu.uint8)
@@ -112,7 +106,7 @@ def cu_dequantize_nonlinear(quants: cu.ndarray, config: QuantConfig, out: cu.nda
             cu.bitwise_and(cu.right_shift(rest, 2, out=scratch), 3, out=scratch)
         unpacked[..., eighth * 3:] |= cu.bitwise_and(rest, 3, out=scratch)
         cu.take(CU_FP16_WEIGHT_INT5_8_VALUES, unpacked, out=out.view(cu.uint32))
-    elif config._BITS() == 4:
+    elif config._BITS == 4:
         cu.take(CU_FP16_WEIGHT_INT4_8_VALUES, quants[..., :eighth * 4], out=out.view(cu.uint32))
     
     # Unpack scales
@@ -121,25 +115,25 @@ def cu_dequantize_nonlinear(quants: cu.ndarray, config: QuantConfig, out: cu.nda
     superScales = CU_FP16_SCALE_UE5M3_VALUES[superScales]
     subScales = CU_FP16_SCALE_INT4_8_VALUES[subScales].view(cu.float16)
     # Use inplace reshape to merge both scale levels
-    reshaped = subScales.reshape((-1, config._SUB_BLOCKS_PER_SUPER()))
+    reshaped = subScales.reshape((-1, config._SUB_BLOCKS_PER_SUPER))
     reshaped *= superScales.reshape((-1, 1))
 
     # Use inplace reshape to multiply the elements by their respective scale
-    reshaped = out.reshape((-1, config._QUANT_SUB_BLOCK()))
+    reshaped = out.reshape((-1, config._SUB_BLOCK))
     reshaped *= subScales.reshape((-1, 1))
     return out
 
 def cu_dequantize_2d(quants: cu.ndarray, config: QuantConfig, out: cu.ndarray | None = None) -> cu.ndarray:
     
     # Number of elements in the first dimension
-    dims = int(quants.shape[-1] * 8 / config.element_size())
-    superBlocks = dims // config._QUANT_SUPER_BLOCK()
-    subBlocks = dims // config._QUANT_SUB_BLOCK()
+    dims = int(quants.shape[-1] * 8 / config._ELEMENT_SIZE)
+    superBlocks = dims // config._SUPER_BLOCK
+    subBlocks = dims // config._SUB_BLOCK
     superScales = quants[..., -(subBlocks // 2 + superBlocks):-(subBlocks // 2)]
     subInfo = quants[..., -(subBlocks // 2):]
     
     # Unpack spins
-    spins = cu.empty((*quants.shape[:-1], subBlocks), dtype=np.uint8 if config._BITS() < 4 else np.uint16)
+    spins = cu.empty((*quants.shape[:-1], subBlocks), dtype=np.uint8 if config._BITS < 4 else np.uint16)
     cu.left_shift(subInfo, 2, out=spins[..., :spins.shape[-1] // 2])
     spins[..., spins.shape[-1] // 2:] = subInfo
     spins &= 0xC0
@@ -149,14 +143,14 @@ def cu_dequantize_2d(quants: cu.ndarray, config: QuantConfig, out: cu.ndarray | 
     if out is None:
         out = cu.empty((*quants.shape[:-1], dims), dtype=cu.float16)
         
-    if config._BITS() == 4:
+    if config._BITS == 4:
         spins <<= 2
         tmp = quants[..., :eighth * 4].astype(cu.uint16)
-        spinMerge = tmp.reshape(-1, config._QUANT_SUB_BLOCK() // 2)
+        spinMerge = tmp.reshape(-1, config._SUB_BLOCK // 2)
         spinMerge |= spins.reshape(-1, 1)
         cu.take(CU_FP16_WEIGHT_INT4_2D_VALUES, tmp, out=out.view(cu.uint32))
 
-    elif config._BITS() == 3:
+    elif config._BITS == 3:
         # Unpack the 3 bit weights into a single buffer, with 6 bit integers 
         # representing 2 weights, without using temporary arrays
         unpacked = cu.empty((*quants.shape[:-1], dims // 2), dtype=cu.uint8)
@@ -166,26 +160,26 @@ def cu_dequantize_2d(quants: cu.ndarray, config: QuantConfig, out: cu.ndarray | 
         unpacked[..., eighth * 2:eighth * 3] <<= 4
         unpacked[..., :eighth] |= unpacked[..., eighth * 2:eighth * 3]
         cu.right_shift(quants[..., :eighth * 3], 2, out=unpacked[..., eighth:])
-        spinMerge = unpacked.reshape(-1, config._QUANT_SUB_BLOCK() // 2)
+        spinMerge = unpacked.reshape(-1, config._SUB_BLOCK // 2)
         spinMerge |= spins.reshape(-1, 1)
         cu.take(CU_FP16_WEIGHT_INT3_2D_VALUES, unpacked, out=out.view(cu.uint32))
 
-    elif config._BITS() == 2:
+    elif config._BITS == 2:
         unpacked = cu.empty((*quants.shape[:-1], dims // 2), dtype=cu.uint8)
         cu.bitwise_and(quants[..., :eighth * 2], 0xF, out=unpacked[..., :unpacked.shape[-1]//2])
         cu.right_shift(quants[..., :eighth * 2], 4, out=unpacked[..., unpacked.shape[-1]//2:])
-        spinMerge = unpacked.reshape(-1, config._QUANT_SUB_BLOCK() // 2)
+        spinMerge = unpacked.reshape(-1, config._SUB_BLOCK // 2)
         spinMerge |= spins.reshape(-1, 1)
         cu.take(CU_FP16_WEIGHT_INT2_2D_VALUES, unpacked, out=out.view(cu.uint32))
 
     # Unpack scales and merge them
     superScales = CU_FP16_SCALE_UE5M3_VALUES[superScales]
     subScales = CU_FP16_SCALE_INT2_8_VALUES[subInfo].view(cu.float16)
-    mergedScales = subScales.reshape(-1, config._SUB_BLOCKS_PER_SUPER())
+    mergedScales = subScales.reshape(-1, config._SUB_BLOCKS_PER_SUPER)
     mergedScales *= superScales.reshape(-1, 1)
 
     # Use inplace reshape to multiply the elements by their respective scale
-    reshaped = out.reshape(-1, config._QUANT_SUB_BLOCK())
+    reshaped = out.reshape(-1, config._SUB_BLOCK)
     reshaped *= mergedScales.reshape(-1, 1)
     return out
 
@@ -196,6 +190,6 @@ def cu_dequantize(quants: cu.ndarray, config: QuantConfig, out: cu.ndarray | Non
         quants: quantized vector or matrix
         config: configuration used for quantizing the data
     """
-    if config._USE_NONLINEAR():
+    if config._NONLINEAR:
         return cu_dequantize_nonlinear(quants, config, out)
     return cu_dequantize_2d(quants, config, out)

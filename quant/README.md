@@ -13,7 +13,7 @@ The algorithm performs respectably against industry standards like bitsandbytes 
 The algorithm is based on other microscaling formats like MXFP4, NVFP4 and the different methods in GGUF.
 - There are 2 sets of scales, with one super scale in FP8 format and sub scales in INT4 or INT2 format. The groups sizes are 128 for super scales and 8/16/32 for sub scales depending on the configuration.  
 - There are 2 methods to encode the weights:
-    - The first is faster and is used for 4 bits and up. The actual weight is obtained by dividing the signed integer weight by 2^(N-1)-1, where N is the number of bits, and applying this formula `(abs(x)*x+2x)/3`. As we are using signed integers there is always one more negative value than positive, and this asymmetry leads to poor slot utilization below 4 bits.  
+    - The first is faster and is used for 5 bits and up. The actual weight is obtained by dividing the signed integer weight by 2^(N-1)-1, where N is the number of bits, and applying this formula `(abs(x)*x+2x)/3`. As we are using signed integers there is always one more negative value than positive, and this asymmetry leads to poor slot utilization below 4 bits.  
     - At lower bit rates the weights are grouped in pairs, treated as points in a 2D plane and converted into magnitudes and angles. Given N as the number of bits, 2^N-1 values are allocated for magnitudes, 2^N+1 for angles and the last value is allocated for the 0. This gives much more even slot utilization, necessary for optimal quantization.
 
 ### Optimization
