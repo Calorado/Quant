@@ -95,6 +95,8 @@ SCALE_INT2_8_VALUES = np.array([
         for i in range(256)
 ])
 
+NUMBER_SPINS = 4
+
 class QuantConfig:
     def __init__(
             this, 
@@ -555,7 +557,8 @@ def quantize_2d(
         unpackedScales /= SUB_SCALES_INT2_BINS
         normSubMaximums = subScales.reshape(-1, config._SUB_BLOCKS_PER_SUPER)
         normSubMaximums /= unpackedScales.reshape(-1, 1)
-        subScales += subBias
+        biased = subScales.reshape(-1, len(subBias))
+        biased += subBias
         np.ceil(subScales, out=subScales)
         subScales = np.clip(subScales, 1, SUB_SCALES_INT2_BINS, out=subScales)
 
@@ -586,7 +589,7 @@ def quantize_2d(
         # Quantize the angles
         if tiling != 1:
             angles = np.tile(angles, tiling)
-        anglesShift = magnitudes.reshape(-1, config._SUB_BLOCK // 2) * 0.5
+        anglesShift = magnitudes.reshape(-1, len(spins), config._SUB_BLOCK // 2) * 0.5
         anglesShift += spins.reshape(-1, 1)
         anglesShift = anglesShift.reshape(magnitudes.shape)
         angles0 = np.subtract(angles, anglesShift, out=angles)
@@ -594,8 +597,8 @@ def quantize_2d(
         np.rint(angles0, out=angles0)
 
         # Second part: dequantize magnitudes and angles, apply calibration and find the optimal point of the codebook
-        dqAngles = np.empty(angles.shape, dtype=np.float32)
-        scratch0 = np.empty(angles.shape, dtype=np.float32)
+        dqAngles = np.empty(angles0.shape, dtype=np.float32)
+        scratch0 = np.empty(angles0.shape, dtype=np.float32)
         scratch1 = anglesShift   # We will reuse this buffer later
 
         # Test point 0
@@ -651,39 +654,38 @@ def quantize_2d(
 
         superBiasLength = superBiasRange[1] - superBiasRange[0]
         subBiasLength = subBiasRange[1] - subBiasRange[0]
-        NUMBER_SPINS = 4
 
         tiling = subBiasLength * NUMBER_SPINS * superBiasLength
         superBias = np.repeat(np.arange(superBiasRange[0], superBiasRange[1], 1), subBiasLength * NUMBER_SPINS * numSuperBlocks)
-        subBias = np.tile(np.repeat(np.arange(subBiasRange[0], subBiasRange[1], 1), numSubBlocks * NUMBER_SPINS), superBiasLength)
-        spins = np.tile(np.repeat(np.arange(0.0, 1.0, 0.25, dtype=np.float32), numSubBlocks), subBiasLength * superBiasLength)
+        subBias = np.repeat(np.arange(subBiasRange[0], subBiasRange[1], 1), numSubBlocks * NUMBER_SPINS)
+        spins = np.repeat(np.arange(0.0, 1.0, 0.25, dtype=np.float32), numSubBlocks)
 
         outMagnitudes, outAngles, superScales, subScales, mergedScales = quantize_internal(
             magnitudes, angles, superBias, subBias, spins, axisCalibration, tiling
         )
 
-        # Merge magnitudes, angles and spins, and combine with the scales
+        # Merge magnitudes, angles and spins
+        # For 4 bits and up we will need a wider integer for the lookup
+        lookupDtype = np.uint16 if config._BITS >= 4 else np.uint8  
         values = np.multiply(outMagnitudes, bitValues + 1, out=outMagnitudes)
         values += outAngles
         values -= bitValues
         np.maximum(values, 0, out=values)
-        values = values.astype(np.uint16 if config._BITS >= 4 else np.uint8)
-        # Convert spins to int and combine them with the rest for a table lookup
-        spins *= [None, 256, 256, 256, 1024, 4096, 16384, None, 262144][config._BITS]
+        values = values.astype(lookupDtype)
+
+        # Convert spins to int and combine them with the values for a table lookup
+        spinsBits = [None, 256, 256, 256, 1024, 4096, 16384, None, 262144][config._BITS]
+        merged = values.reshape(subBiasLength * superBiasLength, NUMBER_SPINS, -1)
+        merged |= np.arange(0, spinsBits, spinsBits // 4, dtype=lookupDtype).reshape(-1, 1)
 
         if config._BITS == 4:
-            merged = values.reshape(-1, config._SUB_BLOCK // 2)
-            merged |= spins.astype(np.uint16).reshape(-1, 1)
             dequantized = WEIGHT_INT4_2D_VALUES[values].view(np.float32)
         elif config._BITS == 3:
-            merged = values.reshape(-1, config._SUB_BLOCK // 2)
-            merged |= spins.astype(np.uint8).reshape(-1, 1)
             dequantized = WEIGHT_INT3_2D_VALUES[values].view(np.float32)
         elif config._BITS == 2:
-            merged = values.reshape(-1, config._SUB_BLOCK // 2)
-            merged |= spins.astype(np.uint8).reshape(-1, 1)
             dequantized = WEIGHT_INT2_2D_VALUES[values].view(np.float32)
 
+        # Combine with the scales
         scaled = dequantized.reshape(-1, config._SUB_BLOCK)
         scaled *= mergedScales.reshape(-1, 1)
 
@@ -735,7 +737,7 @@ def quantize_2d(
         bestSpins -= np.floor(bestSpins, out=scratch)
         bestSpins *= 4
         bestSpins = np.rint(bestSpins, out=bestSpins)
-        bestSpins /= 4
+        bestSpins *= 0.25
         bestSpins -= np.floor(bestSpins, out=scratch)
     
     # Generate final quantized vector
